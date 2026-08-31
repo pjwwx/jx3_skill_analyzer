@@ -1,0 +1,30 @@
+# Python / Qt / PyInstaller
+.venv/
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.spec.bak
+
+# Native and third-party build products
+.deps/
+*.exe
+*.dll
+*.pdb
+*.obj
+*.lib
+*.exp
+*.zip
+
+# Analyzer caches and generated results
+package_cache/
+技能解析_*/
+解析结果/
+.jx3_extract_*.txt
+.jx3_skill_analyzer_*.exe
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
