@@ -107,4 +107,6 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 
 ## 第三方组件
 
-字节码反编译使用 `unluac-rs 1.4.3`；桌面界面使用 `PySide6 Essentials`；PakV4 互操作部分参考了用户提供的 PakV4-Extract 源码。详情见 `THIRD_PARTY_NOTICES.md`。
+PakV4 解包互操作部分基于 [jx3pak/PakV4-Extract](https://github.com/jx3pak/PakV4-Extract) 的公开源码实现，使用了其中的游戏 DLL 接口声明、PakV4 初始化和资源读取流程；本项目在此基础上重写了路径解析、显式输出目录、诊断、GUI 调用与临时组件管理。
+
+字节码反编译使用 `unluac-rs 1.4.3`，桌面界面使用 `PySide6 Essentials`。完整来源与使用范围见 `THIRD_PARTY_NOTICES.md`。

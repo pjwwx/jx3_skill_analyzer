@@ -1,12 +1,14 @@
 # Third-party notices
 
-## PakV4-Extract interoperability reference
+## PakV4-Extract
 
-- Project: https://github.com/jx3pak/PakV4-Extract
-- Use in this project: function declarations and initialization behavior were used as an interoperability reference for `native/jx3_pak_extract.cpp`
+- Upstream project: https://github.com/jx3pak/PakV4-Extract
+- Upstream description: JX3 Pak/PakV2/PakV3/PakV4/PakV5 extraction source
+- Use in this project: the PakV4 interoperability implementation in `native/jx3_pak_extract.cpp` is based on this upstream source, including the game DLL interface declarations, PakV4 initialization sequence, resource lookup and resource reading flow
+- Changes in this project: rewritten command-line contract, explicit game/output paths, current-directory independence, diagnostics, batch output handling and GUI-managed temporary execution
 - Generated binary: `vendor/JX3PakBridge.exe`, compiled locally from the source shipped in this project and excluded from Git
 
-The upstream repository did not include a separate license file in the user-provided source snapshot. The rewritten helper is kept as source in this project so its behavior can be audited and rebuilt.
+The upstream repository did not include a separate license file when this notice was written. This declaration identifies the source and scope of use; it does not claim that the upstream work was authored by this project. The adapted helper remains available as source so its behavior can be audited and rebuilt.
 
 ## unluac-rs 1.4.3
 

@@ -1,5 +1,11 @@
 // JX3 PakV4 extraction helper.
 //
+// PakV4 interoperability is based on the public jx3pak/PakV4-Extract source:
+// https://github.com/jx3pak/PakV4-Extract
+// It uses the upstream game-DLL interface declarations, PakV4 initialization
+// sequence, resource lookup and resource reading flow. This implementation
+// rewrites path handling, output control, diagnostics and GUI integration.
+//
 // The GUI stages this statically linked helper temporarily in the selected
 // bin64 directory.  This preserves the game's application-directory DLL search
 // behavior without asking users to copy or launch anything manually.  The
