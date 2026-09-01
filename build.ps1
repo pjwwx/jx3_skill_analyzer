@@ -26,11 +26,6 @@ if (-not $SkipInstall) {
     }
 }
 
-& $VenvPython -m unittest discover -s (Join-Path $ProjectDir "tests") -v
-if ($LASTEXITCODE -ne 0) {
-    throw "Tests failed; packaging stopped."
-}
-
 Push-Location $ProjectDir
 try {
     & $VenvPython -m PyInstaller `

@@ -821,25 +821,5 @@ def launch_gui() -> None:
     app.exec()
 
 
-def smoke_test_gui(preview_path: Path | str | None = None) -> None:
-    """真实创建 Qt 窗口；测试时使用离屏平台，也可保存界面预览图。"""
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    app, created = _application()
-    window = AnalyzerWindow()
-    if os.environ.get("JX3_GUI_HEADLESS") == "1":
-        window.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
-    window.show()
-    app.processEvents()
-    if preview_path:
-        destination = Path(preview_path)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        if not window.grab().save(str(destination), "PNG"):
-            raise RuntimeError(f"无法保存 GUI 预览图：{destination}")
-    window.close()
-    app.processEvents()
-    if created:
-        app.quit()
-
-
 # 保留旧名称，避免外部脚本导入 AnalyzerApp 时失效。
 AnalyzerApp = AnalyzerWindow

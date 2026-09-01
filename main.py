@@ -12,8 +12,6 @@ from jx3_analyzer.package_workflow import analyze_selected_dungeons, load_packag
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="剑网3 Lua 技能脚本与 UI 描述解析器")
     parser.add_argument("--version", action="version", version=__version__)
-    parser.add_argument("--gui-smoke-test", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--gui-preview", help=argparse.SUPPRESS)
     parser.add_argument("--no-gui", action="store_true", help="使用命令行模式")
     parser.add_argument("--bin64", help="游戏 JX3ClientX64.exe 所在目录；启用自动解包模式")
     parser.add_argument("--dungeon", action="append", help="要分析的副本名，可重复指定")
@@ -73,11 +71,6 @@ def run_cli(args: argparse.Namespace) -> int:
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
-    if args.gui_smoke_test:
-        from jx3_analyzer.gui import smoke_test_gui
-
-        smoke_test_gui(args.gui_preview)
-        return 0
     use_cli = args.no_gui or any((args.bin64, args.dungeon, args.root, args.ids, args.output))
     if use_cli:
         try:

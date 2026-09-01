@@ -2,7 +2,7 @@
 
 这是旧版 `ngb.py` 的重做版。它按每个技能脚本的真实文件内容判断格式，兼容普通 Lua 源码和标准 Lua 字节码；字节码会先离线反编译，再使用不依赖局部变量名的规则提取技能效果。3.0 版把 PakV4 解包、可选副本发现、技能 ID 汇总和脚本提取全部接入程序，通常不再需要手工制作解包清单或技能 ID 文件。
 
-> 本仓库只提供源码、测试和构建脚本，不提供任何预编译 EXE、游戏数据或解包结果。请自行审阅并在本机完成构建。
+> 本仓库只提供源码和构建脚本，不提供测试目录、预编译 EXE、游戏数据或解包结果。请自行审阅并在本机完成构建。
 
 <p align="center">
   <img src="docs/images/main-window-v3.0.2.png" width="1280" alt="剑网3技能脚本解析器 v3.0.2 主界面">
@@ -88,7 +88,7 @@ Lua 字节码反编译器固定使用 `unluac-rs v1.4.3`。下面的脚本会从
 powershell -ExecutionPolicy Bypass -File .\build-unluac.ps1
 ```
 
-也可以直接运行总构建脚本。缺少上述两个组件时，它会先调用对应源码构建脚本，然后创建隔离的 `.venv`、运行测试并使用 PyInstaller 打包：
+也可以直接运行总构建脚本。缺少上述两个组件时，它会先调用对应源码构建脚本，然后创建隔离的 `.venv` 并使用 PyInstaller 打包：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\build.ps1

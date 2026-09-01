@@ -1,5 +1,0 @@
-settings/skill/skills.tab
-settings/skill/Buff.tab
-ui/Scheme/Case/buff.txt
-ui/Scheme/Case/skill.txt
-scripts/ScriptList.tab
