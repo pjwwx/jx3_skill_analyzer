@@ -4,6 +4,7 @@ __pycache__/
 *.py[cod]
 build/
 dist/
+*.spec
 *.spec.bak
 
 # Native and third-party build products
