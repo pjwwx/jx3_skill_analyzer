@@ -7,7 +7,7 @@ import threading
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, QTimer, Signal, Slot
-from PySide6.QtGui import QColor, QCloseEvent, QFont, QIcon, QPainter, QPixmap
+from PySide6.QtGui import QColor, QCloseEvent, QFont, QIcon, QPainter, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -39,6 +39,7 @@ from .package_workflow import (
     DungeonInfo,
     PackageCatalog,
     analyze_selected_dungeons,
+    finalize_analysis_output,
     load_package_catalog,
     resolve_bin64,
 )
@@ -49,6 +50,8 @@ QWidget {
     color: #172033;
     font-family: "Microsoft YaHei UI";
     font-size: 14px;
+    selection-color: #172033;
+    selection-background-color: #bfdbfe;
 }
 QWidget#appBackground { background: #f3f6fb; }
 QScrollArea#pageScroll { background: #f3f6fb; border: none; }
@@ -180,6 +183,89 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 """
 
 
+MESSAGE_STYLE = """
+QMessageBox, QDialogButtonBox {
+    color: #172033;
+    background-color: #ffffff;
+    font-family: "Microsoft YaHei UI";
+    font-size: 14px;
+}
+QMessageBox QLabel {
+    color: #172033;
+    background-color: transparent;
+    selection-color: #172033;
+    selection-background-color: #bfdbfe;
+}
+QMessageBox QPushButton {
+    color: #ffffff;
+    background-color: #2563eb;
+    border: 1px solid #2563eb;
+    border-radius: 8px;
+    min-width: 70px;
+    min-height: 36px;
+    padding: 0 16px;
+    font-family: "Microsoft YaHei UI";
+    font-size: 14px;
+    font-weight: 600;
+}
+QMessageBox QPushButton:hover { background-color: #1d4ed8; border-color: #1d4ed8; }
+QMessageBox QPushButton:pressed { background-color: #1e40af; border-color: #1e40af; }
+QMessageBox QPushButton:focus { border: 2px solid #172554; padding: 0 15px; }
+QMessageBox QPushButton:disabled { color: #64748b; background-color: #e8edf4; border-color: #dbe2ec; }
+"""
+
+
+def _light_palette() -> QPalette:
+    """Keep unspecified controls readable when Windows uses a dark palette."""
+    palette = QPalette()
+    roles = {
+        QPalette.ColorRole.Window: "#ffffff",
+        QPalette.ColorRole.WindowText: "#172033",
+        QPalette.ColorRole.Base: "#ffffff",
+        QPalette.ColorRole.AlternateBase: "#f1f5f9",
+        QPalette.ColorRole.Text: "#172033",
+        QPalette.ColorRole.Button: "#ffffff",
+        QPalette.ColorRole.ButtonText: "#172033",
+        QPalette.ColorRole.Highlight: "#bfdbfe",
+        QPalette.ColorRole.HighlightedText: "#172033",
+        QPalette.ColorRole.ToolTipBase: "#ffffff",
+        QPalette.ColorRole.ToolTipText: "#172033",
+        QPalette.ColorRole.PlaceholderText: "#6b7890",
+        QPalette.ColorRole.Link: "#1d4ed8",
+        QPalette.ColorRole.LinkVisited: "#6d28d9",
+    }
+    for role, color in roles.items():
+        palette.setColor(role, QColor(color))
+    for role in (QPalette.ColorRole.WindowText, QPalette.ColorRole.Text, QPalette.ColorRole.ButtonText):
+        palette.setColor(QPalette.ColorGroup.Disabled, role, QColor("#64748b"))
+    return palette
+
+
+def _create_message_box(parent: QWidget, icon: QMessageBox.Icon, title: str, text: str) -> QMessageBox:
+    """Use one explicitly styled Qt dialog for every application notification."""
+    message = QMessageBox(parent)
+    message.setOption(QMessageBox.Option.DontUseNativeDialog, True)
+    message.setPalette(_light_palette())
+    message.setStyleSheet(MESSAGE_STYLE)
+    message.setWindowTitle(title)
+    message.setTextFormat(Qt.TextFormat.PlainText)
+    message.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+    message.setIcon(icon)
+    message.setText(text)
+    message.setStandardButtons(QMessageBox.StandardButton.Ok)
+    message.setDefaultButton(QMessageBox.StandardButton.Ok)
+    message.button(QMessageBox.StandardButton.Ok).setText("确定")
+    return message
+
+
+def _show_message(parent: QWidget, icon: QMessageBox.Icon, title: str, text: str) -> None:
+    message = _create_message_box(parent, icon, title, text)
+    try:
+        message.exec()
+    finally:
+        message.deleteLater()
+
+
 class WorkerSignals(QObject):
     progress = Signal(int, int, str)
     catalog_loaded = Signal(object)
@@ -190,9 +276,11 @@ class WorkerSignals(QObject):
 class AnalyzerWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
+        self.setPalette(_light_palette())
         self.config_path = self._config_path()
         self.config_data = self._load_config()
         self.last_output: Path | None = None
+        self.last_workbook: Path | None = None
         self.catalog: PackageCatalog | None = None
         self._worker: threading.Thread | None = None
         self.signals = WorkerSignals(self)
@@ -250,8 +338,8 @@ class AnalyzerWindow(QMainWindow):
     def _build_ui(self) -> None:
         self.setWindowTitle("剑网3 技能脚本解析器")
         self.setWindowIcon(_create_app_icon())
-        self.setMinimumSize(820, 600)
-        self.resize(1120, 800)
+        self.setMinimumSize(760, 520)
+        self.resize(1060, 790)
 
         central = QWidget(objectName="appBackground")
         self.setCentralWidget(central)
@@ -260,7 +348,7 @@ class AnalyzerWindow(QMainWindow):
         self.scroll_area = QScrollArea(objectName="pageScroll")
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
-        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         central_layout.addWidget(self.scroll_area)
 
         self.page_widget = QWidget(objectName="appBackground")
@@ -276,11 +364,11 @@ class AnalyzerWindow(QMainWindow):
         hero = QVBoxLayout()
         hero.setSpacing(3)
         title = QLabel("剑网3 技能脚本解析器", objectName="heroTitle")
-        subtitle = QLabel("从本地游戏包提取技能、Buff 与界面描述，源码和字节码可混合处理。", objectName="heroSubtitle")
+        subtitle = QLabel("按副本读取本地 V4 技能、NPC、交互物品与官方资料，结果汇总为 Excel。", objectName="heroSubtitle")
         hero.addWidget(title)
         hero.addWidget(subtitle)
         header_layout.addLayout(hero, 1)
-        badge = QLabel(f"本地离线  ·  v{__version__}", objectName="versionBadge")
+        badge = QLabel(f"本地 V4  ·  v{__version__}", objectName="versionBadge")
         badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
         header_layout.addWidget(badge, 0, Qt.AlignmentFlag.AlignVCenter)
         page.addWidget(header)
@@ -325,7 +413,7 @@ class AnalyzerWindow(QMainWindow):
         search_row.addWidget(QLabel("选择副本", objectName="fieldLabel"))
         search_row.addSpacing(8)
         self.dungeon_search = QLineEdit()
-        self.dungeon_search.setPlaceholderText("输入副本名筛选")
+        self.dungeon_search.setPlaceholderText("输入副本名、人数或难度筛选")
         self.dungeon_search.setClearButtonEnabled(True)
         self.dungeon_search.textChanged.connect(self._filter_dungeons)
         search_row.addWidget(self.dungeon_search, 1)
@@ -349,7 +437,7 @@ class AnalyzerWindow(QMainWindow):
         selection_actions.addWidget(clear_selection)
         selection_actions.addStretch(1)
         auto_layout.addLayout(selection_actions)
-        self.mode_tabs.addTab(auto_tab, "自动读取游戏包")
+        self.mode_tabs.addTab(auto_tab, "按副本读取 V4 游戏包")
 
         self.manual_tab = QWidget()
         manual_layout = QVBoxLayout(self.manual_tab)
@@ -441,7 +529,7 @@ class AnalyzerWindow(QMainWindow):
         self.run_button = QPushButton("开始解析所选副本", objectName="primaryButton")
         self.run_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.run_button.clicked.connect(self._start)
-        self.open_button = QPushButton("打开结果目录", objectName="secondaryButton")
+        self.open_button = QPushButton("打开汇总表", objectName="secondaryButton")
         self.open_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.open_button.setEnabled(False)
         self.open_button.clicked.connect(self._open_output)
@@ -526,7 +614,7 @@ class AnalyzerWindow(QMainWindow):
     def _load_dungeons(self) -> None:
         bin64 = self.bin64_edit.text().strip()
         if not bin64:
-            QMessageBox.warning(self, "信息不完整", "请先选择剑网3 bin64 目录。")
+            _show_message(self, QMessageBox.Icon.Warning, "信息不完整", "请先选择剑网3 bin64 目录。")
             return
         self._save_config()
         self.load_button.setEnabled(False)
@@ -536,7 +624,7 @@ class AnalyzerWindow(QMainWindow):
         self.status_label.setText("正在读取游戏包…")
         self.status_meta.setText("首次读取通常只需几秒")
         self.log.clear()
-        self._append_log("开始读取技能表、UI 描述与脚本清单")
+        self._append_log("开始读取 V4 技能表、地图列表与官方资料入口")
 
         def worker() -> None:
             try:
@@ -558,16 +646,17 @@ class AnalyzerWindow(QMainWindow):
         self.dungeon_list.clear()
         for dungeon in catalog.dungeons:
             item = QListWidgetItem(
-                f"{dungeon.name}    {dungeon.skill_count} 个技能  ·  {dungeon.script_count} 个脚本"
+                f"{dungeon.display_name}    {dungeon.skill_count} 个技能  ·  {dungeon.script_count} 个脚本"
             )
-            item.setData(Qt.ItemDataRole.UserRole, dungeon.name)
-            item.setToolTip(f"{dungeon.name}\n技能 {dungeon.skill_count} 个，相关脚本 {dungeon.script_count} 个")
+            item.setData(Qt.ItemDataRole.UserRole, dungeon.selection_key)
+            map_hint = "、".join(dungeon.map_ids) or "未明确关联地图"
+            item.setToolTip(f"{dungeon.display_name}\n地图 ID：{map_hint}\n技能目录：{dungeon.skill_folder or dungeon.name}\n技能 {dungeon.skill_count} 个，相关脚本 {dungeon.script_count} 个\n共用技能目录的多个难度会引用同一技能集合；NPC 和官方资料按所选地图读取。")
             self.dungeon_list.addItem(item)
         self._filter_dungeons(self.dungeon_search.text())
         self.load_button.setEnabled(True)
         self.run_button.setEnabled(True)
         self.progress.setValue(self.progress.maximum())
-        self.catalog_meta.setText(f"已读取 {len(catalog.dungeons)} 个副本")
+        self.catalog_meta.setText(f"已读取 {len(catalog.dungeons)} 项副本与难度")
         self.status_label.setText("副本列表已就绪，请选择一个或多个副本。")
         self.status_meta.setText("可输入名称筛选；按住 Ctrl 可逐项多选")
         self._append_log(f"副本列表读取完成：{len(catalog.dungeons)} 个")
@@ -578,7 +667,7 @@ class AnalyzerWindow(QMainWindow):
         keyword = text.strip().casefold()
         for index in range(self.dungeon_list.count()):
             item = self.dungeon_list.item(index)
-            name = str(item.data(Qt.ItemDataRole.UserRole) or "")
+            name = item.text()
             item.setHidden(bool(keyword and keyword not in name.casefold()))
 
     def _select_visible_dungeons(self) -> None:
@@ -670,26 +759,27 @@ class AnalyzerWindow(QMainWindow):
     def _start_automatic(self) -> None:
         output = self.output_edit.text().strip()
         if self.catalog is None:
-            QMessageBox.warning(self, "尚未读取副本", "请先点击“读取 / 刷新副本列表”。")
+            _show_message(self, QMessageBox.Icon.Warning, "尚未读取副本", "请先点击“读取 / 刷新副本列表”。")
             return
         selected_names = [
             str(item.data(Qt.ItemDataRole.UserRole)) for item in self.dungeon_list.selectedItems()
         ]
         if not selected_names or not output:
-            QMessageBox.warning(self, "信息不完整", "请选择至少一个副本，并确认结果存放位置。")
+            _show_message(self, QMessageBox.Icon.Warning, "信息不完整", "请选择至少一个副本，并确认结果存放位置。")
             return
         try:
             current_bin64 = resolve_bin64(self.bin64_edit.text().strip())
         except Exception as exc:
-            QMessageBox.warning(self, "游戏目录不可用", str(exc))
+            _show_message(self, QMessageBox.Icon.Warning, "游戏目录不可用", str(exc))
             return
         if current_bin64 != self.catalog.bin64:
-            QMessageBox.warning(self, "需要刷新", "游戏目录已经改变，请重新读取副本列表。")
+            _show_message(self, QMessageBox.Icon.Warning, "需要刷新", "游戏目录已经改变，请重新读取副本列表。")
             return
 
         self._save_config()
         self._begin_run("正在准备所选副本…", f"共选择 {len(selected_names)} 个副本")
-        self._append_log("开始自动解包并解析：" + "、".join(selected_names))
+        labels = [d.display_name for d in self.catalog.find(selected_names)]
+        self._append_log("开始按副本读取并解析：" + "、".join(labels))
 
         def worker() -> None:
             try:
@@ -715,7 +805,7 @@ class AnalyzerWindow(QMainWindow):
         ids_file = self.ids_edit.text().strip()
         output = self.output_edit.text().strip()
         if not root or not ids_file or not output:
-            QMessageBox.warning(self, "信息不完整", "请选择本地包根目录、技能 ID 文件和结果存放位置。")
+            _show_message(self, QMessageBox.Icon.Warning, "信息不完整", "请选择本地包根目录、技能 ID 文件和结果存放位置。")
             return
 
         advanced = {
@@ -736,6 +826,7 @@ class AnalyzerWindow(QMainWindow):
                     self.signals.progress.emit(current, total, message)
 
                 result = analyze_ids_file(paths, ids_file, output, report)
+                result = finalize_analysis_output(result)
                 self.signals.completed.emit(result)
             except Exception as exc:
                 self.signals.failed.emit(str(exc))
@@ -754,15 +845,27 @@ class AnalyzerWindow(QMainWindow):
     @Slot(object)
     def _on_done(self, result: RunResult) -> None:
         self.last_output = result.output_dir
+        self.last_workbook = Path(getattr(result, "workbook", result.skill_csv))
         self.run_button.setEnabled(True)
         self.load_button.setEnabled(True)
         self.open_button.setEnabled(True)
         self.progress.setValue(self.progress.maximum())
         summary = f"解析完成：成功 {result.successful_skills} 个，失败 {result.failed_skills} 个"
         self.status_label.setText(summary)
-        self.status_meta.setText(f"关联 Buff {result.buff_links} 行  ·  已保存到 {result.output_dir.name}")
+        self.status_meta.setText(f"关联 Buff {result.buff_links} 行  ·  已生成 {self.last_workbook.name}")
         self._append_log(summary)
-        QMessageBox.information(self, "解析完成", summary + f"\n\n结果目录：\n{result.output_dir}")
+        counts = getattr(result, "resource_counts", {})
+        if counts:
+            labels = (("maps", "地图"), ("npc_templates", "NPC模板"), ("doodad_templates", "交互物品模板"), ("active_dbm_rules", "官方DBM有效规则"))
+            readable = "  ·  ".join(f"{label} {counts.get(key, 0)}" for key, label in labels)
+            self._append_log("副本资料：" + readable)
+            if counts.get("issues"):
+                self._append_log(f"有 {counts['issues']} 条资料读取或关联说明，请查看汇总表中的“问题”工作表。")
+        self._append_log(f"汇总表：{self.last_workbook}")
+        if counts:
+            self._append_log("NPC、交互物品、官方 DBM、百科和读取状态已汇总为同一份 Excel。")
+        self._append_log("JSON 与原始资料分别保存在结果目录中的对应文件夹。")
+        _show_message(self, QMessageBox.Icon.Information, "解析完成", summary + f"\n\n汇总表：\n{self.last_workbook}\n\nJSON 与原始资料：\n{result.output_dir}")
 
     @Slot(str)
     def _on_error(self, message: str) -> None:
@@ -771,10 +874,12 @@ class AnalyzerWindow(QMainWindow):
         self.status_label.setText("解析失败")
         self.status_meta.setText("请根据下面的错误信息检查输入路径")
         self._append_log("错误：" + message)
-        QMessageBox.critical(self, "解析失败", message)
+        _show_message(self, QMessageBox.Icon.Critical, "解析失败", message)
 
     def _open_output(self) -> None:
-        if self.last_output and self.last_output.exists():
+        if self.last_workbook and self.last_workbook.exists():
+            os.startfile(self.last_workbook)  # type: ignore[attr-defined]
+        elif self.last_output and self.last_output.exists():
             os.startfile(self.last_output)  # type: ignore[attr-defined]
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt API
@@ -782,8 +887,19 @@ class AnalyzerWindow(QMainWindow):
         super().closeEvent(event)
 
     def show_initial(self) -> None:
-        """用户正常启动时默认最大化；还原窗口后仍可通过滚动区域完整使用。"""
-        self.showMaximized()
+        """Start in a normal window that fits the available desktop area."""
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            width = max(1, available.width() - min(64, available.width() // 10))
+            height = max(1, available.height() - min(72, available.height() // 10))
+            self.setMinimumSize(min(760, width), min(520, height))
+            self.resize(min(1060, width), min(790, height))
+        self.showNormal()
+        if screen is not None:
+            frame = self.frameGeometry()
+            frame.moveCenter(available.center())
+            self.move(frame.topLeft())
 
 
 def _create_app_icon() -> QIcon:
@@ -809,6 +925,7 @@ def _application() -> tuple[QApplication, bool]:
     app.setApplicationName("剑网3 技能脚本解析器")
     app.setApplicationVersion(__version__)
     app.setStyle("Fusion")
+    app.setPalette(_light_palette())
     app.setFont(QFont("Microsoft YaHei UI", 10))
     app.setStyleSheet(APP_STYLE)
     return app, True

@@ -16,13 +16,28 @@ dist/
 *.lib
 *.exp
 *.zip
+*.whl
+*.msi
 
 # Analyzer caches and generated results
 package_cache/
 技能解析_*/
 解析结果/
+outputs/
+work/
+*.xlsx
 .jx3_extract_*.txt
 .jx3_skill_analyzer_*.exe
+
+# Tests and verification artifacts stay outside the source repository
+tests/
+test/
+test_data/
+testdata/
+.pytest_cache/
+htmlcov/
+.coverage
+coverage.xml
 
 # IDE / OS
 .idea/

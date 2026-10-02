@@ -6,9 +6,8 @@
 // sequence, resource lookup and resource reading flow. This implementation
 // rewrites path handling, output control, diagnostics and GUI integration.
 //
-// The GUI stages this statically linked helper temporarily in the selected
-// bin64 directory.  This preserves the game's application-directory DLL search
-// behavior without asking users to copy or launch anything manually.  The
+// This statically linked helper remains outside the game installation and
+// selects the game's DLL directory explicitly. The
 // caller supplies a GBK encoded path list and an arbitrary output directory.
 
 #include <algorithm>
@@ -19,6 +18,7 @@
 #include <string>
 #include <vector>
 
+#define NOMINMAX
 #include <windows.h>
 #include <psapi.h>
 
@@ -55,12 +55,13 @@ struct Options {
     fs::path output;
     bool overwrite = false;
     bool verbose = false;
+    unsigned long headerBytes = 0;
 };
 
 static void print_usage() {
     std::cout
         << "JX3PakBridge --bin64 <game-bin64> --list <gbk-path-list> "
-           "--output <directory> [--overwrite]\n";
+           "--output <directory> [--overwrite] [--header-bytes <512..65536>]\n";
 }
 
 static bool parse_options(int argc, wchar_t** argv, Options& options) {
@@ -72,6 +73,13 @@ static bool parse_options(int argc, wchar_t** argv, Options& options) {
         }
         if (arg == L"--verbose") {
             options.verbose = true;
+            continue;
+        }
+        if (arg == L"--header-bytes" && index + 1 < argc) {
+            wchar_t* end = nullptr;
+            const unsigned long value = wcstoul(argv[++index], &end, 10);
+            if (end == nullptr || *end != L'\0' || value < 512 || value > 65536) return false;
+            options.headerBytes = value;
             continue;
         }
         if ((arg == L"--bin64" || arg == L"--list" || arg == L"--output") &&
@@ -221,7 +229,10 @@ int wmain(int argc, wchar_t** argv) {
     if (options.verbose) {
         std::cerr << "TRACE loading_engine\n";
     }
-    HMODULE engine = LoadLibraryA("Engine_Lua5X64.dll");
+    // Keep the helper outside the game installation and select its DLL
+    // directory explicitly instead of staging an EXE in the installation.
+    SetDllDirectoryW(options.bin64.c_str());
+    HMODULE engine = LoadLibraryW(enginePath.c_str());
     if (engine == nullptr) {
         std::cerr << "ERROR engine_load_failed code=" << GetLastError() << "\n";
         return 69;
@@ -290,10 +301,22 @@ int wmain(int argc, wchar_t** argv) {
             std::cerr << "TRACE checking_file index=" << total << "\n";
         }
 
-        const std::wstring relativeWide = codepage_to_wide(internalPath, 936);
+        std::wstring relativeWide = codepage_to_wide(internalPath, 936);
+        // UI code uses a leading backslash for virtual resource-root paths.
+        // Preserve it for the game API, strip it only for safe output joining.
+        while (!relativeWide.empty() && relativeWide.front() == L'\\') {
+            relativeWide.erase(relativeWide.begin());
+        }
         const fs::path relativePath(relativeWide);
+        const auto reportFile = [&](const char* status, unsigned long declared, unsigned long read) {
+            if (options.verbose) {
+                std::cout << "FILE " << status << " declared=" << declared << " read=" << read
+                          << " path=" << wide_to_codepage(relativeWide, CP_UTF8) << std::endl;
+            }
+        };
         if (relativeWide.empty() || !safe_relative_path(relativePath)) {
             ++invalid;
+            reportFile("invalid", 0, 0);
             continue;
         }
 
@@ -304,11 +327,9 @@ int wmain(int argc, wchar_t** argv) {
             std::cerr << "TRACE hash_ready index=" << total << "\n";
         }
         if (!fileExists(internalPath.c_str())) {
-            ++missing;
             if (options.verbose) {
-                std::cerr << "TRACE file_missing index=" << total << "\n";
+                std::cerr << "TRACE existence_check_false_attempt_open index=" << total << "\n";
             }
-            continue;
         }
         if (options.verbose) {
             std::cerr << "TRACE opening_file index=" << total << "\n";
@@ -317,23 +338,34 @@ int wmain(int argc, wchar_t** argv) {
         const fs::path outputPath = (options.output / relativePath).lexically_normal();
         if (!options.overwrite && fs::exists(outputPath)) {
             ++skipped;
+            reportFile("skipped", 0, 0);
             continue;
         }
 
         IFile* packageFile = openFile(internalPath.c_str(), 0, 0);
         if (packageFile == nullptr) {
-            ++failed;
+            ++missing;
+            reportFile("missing", 0, 0);
             continue;
         }
 
         const unsigned long expectedSize = packageFile->Size();
+        if (!options.headerBytes && expectedSize > 64UL * 1024UL * 1024UL) {
+            std::cerr << "FILE_SIZE_LIMIT size=" << expectedSize << "\n";
+            packageFile->Release();
+            ++failed;
+            reportFile("size_limit", expectedSize, 0);
+            continue;
+        }
         if (options.verbose) {
             std::cerr << "TRACE file_opened index=" << total << " size=" << expectedSize << "\n";
         }
-        std::vector<char> bytes(static_cast<size_t>(expectedSize));
-        const unsigned long actualSize = expectedSize == 0
+        const unsigned long requestedSize = options.headerBytes
+            ? std::min(expectedSize, options.headerBytes) : expectedSize;
+        std::vector<char> bytes(static_cast<size_t>(requestedSize));
+        const unsigned long actualSize = requestedSize == 0
             ? 0
-            : packageFile->Read(bytes.data(), expectedSize);
+            : packageFile->Read(bytes.data(), requestedSize);
         if (options.verbose) {
             std::cerr << "TRACE file_read index=" << total << " size=" << actualSize << "\n";
         }
@@ -341,16 +373,25 @@ int wmain(int argc, wchar_t** argv) {
         if (options.verbose) {
             std::cerr << "TRACE file_released index=" << total << "\n";
         }
+        if (actualSize != requestedSize) {
+            std::cerr << "SHORT_READ index=" << total << " expected=" << requestedSize
+                      << " actual=" << actualSize << "\n";
+            ++failed;
+            reportFile("short_read", requestedSize, actualSize);
+            continue;
+        }
 
         fs::create_directories(outputPath.parent_path(), error);
         if (error) {
             error.clear();
             ++failed;
+            reportFile("write_failed", expectedSize, actualSize);
             continue;
         }
         std::ofstream output(outputPath, std::ios::binary | std::ios::trunc);
         if (!output.is_open()) {
             ++failed;
+            reportFile("write_failed", expectedSize, actualSize);
             continue;
         }
         if (actualSize != 0) {
@@ -359,9 +400,11 @@ int wmain(int argc, wchar_t** argv) {
         output.close();
         if (output.fail()) {
             ++failed;
+            reportFile("write_failed", expectedSize, actualSize);
             continue;
         }
         ++extracted;
+        reportFile(options.headerBytes ? "header" : "extracted", expectedSize, actualSize);
         if (options.verbose) {
             std::cerr << "TRACE file_written index=" << total << "\n";
         }

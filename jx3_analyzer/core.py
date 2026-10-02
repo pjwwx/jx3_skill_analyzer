@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import os
 import re
@@ -13,12 +14,15 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Iterable, Iterator
 
+from . import __version__
 from .lua_analysis import (
     BuffReference,
     LuaFacts,
     analyze_lua,
     detect_lua_kind,
     iter_lua_calls,
+    isolate_lua51_global_functions,
+    extract_function_blocks,
     normalize_dimension_expression,
     numeric_id,
     numeric_property_values,
@@ -107,6 +111,10 @@ SKILL_COLUMNS = [
     "触发的技能ID",
     "属性类型(原始)",
     "解析到的依赖函数",
+    "是否穿刺",
+    "基础伤害表达式",
+    "伤害浮动表达式",
+    "解析说明",
 ]
 
 BUFF_COLUMNS = [
@@ -192,6 +200,14 @@ class SourceArtifact:
     server_dependencies: list[str] = field(default_factory=list)
     missing_dependencies: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    decompile_reliable: bool = True
+    decompile_diagnostics: list[str] = field(default_factory=list)
+    recovered_source_text: str = ""
+    recovered_output: Path | None = None
+    function_recovery: dict = field(default_factory=dict)
+    decompiler_version: str = ""
+    decompiler_sha256: str = ""
+    source_encoding: str = ""
 
 
 @dataclass
@@ -318,28 +334,85 @@ def load_selected_rows(path: Path, key: str, wanted: set[str]) -> dict[str, list
     return result
 
 
-def _unquote_lua(value: str) -> str | None:
+def _unquote_lua(value: str, encoding: str = "gbk") -> str | None:
+    """Decode a literal path without evaluating Lua or double-unescaping it."""
     value = value.strip()
+    long_string = re.fullmatch(r"\[(=*)\[([\s\S]*)\]\1\]", value)
+    if long_string:
+        body = long_string.group(2)
+        return body[2:] if body.startswith("\r\n") else body[1:] if body.startswith(("\n", "\r")) else body
     if len(value) < 2 or value[0] not in "'\"" or value[-1] != value[0]:
         return None
     body = value[1:-1]
-    body = body.replace(r"\\", "\\").replace(r"\"", '"').replace(r"\'", "'")
-    return body
+    escapes = {"a": "\a", "b": "\b", "f": "\f", "n": "\n", "r": "\r",
+               "t": "\t", "v": "\v", "\\": "\\", "\"": "\"", "'": "'"}
+    parts: list[str | int] = []
+    byte_escapes = False
+    index = 0
+    while index < len(body):
+        character = body[index]
+        if character != "\\":
+            if character == value[0] or character in "\r\n":
+                return None  # Not one short literal (e.g. concatenation).
+            parts.append(character)
+            index += 1
+            continue
+        index += 1
+        if index == len(body):
+            return None
+        character = body[index]
+        if "0" <= character <= "9":
+            end = index + 1
+            while end < min(index + 3, len(body)) and "0" <= body[end] <= "9":
+                end += 1
+            number = int(body[index:end])
+            if number > 255:
+                return None
+            parts.append(number)
+            byte_escapes = True
+            index = end
+        elif character in escapes:
+            parts.append(escapes[character])
+            index += 1
+        elif character in "\r\n":
+            if character == "\r" and body[index:index + 2] == "\r\n":
+                index += 1
+            parts.append("\n")
+            index += 1
+        else:
+            # Retain the existing path behavior for legacy unescaped Windows
+            # separators; only recognized Lua escapes are interpreted.
+            parts.extend(("\\", character))
+            index += 1
+    if not byte_escapes:
+        return "".join(str(part) for part in parts)
+    preferred = "utf-8" if encoding.lower().replace("_", "-").startswith(("utf-8", "utf8")) else "gbk"
+    for candidate_encoding in (preferred, "gbk" if preferred == "utf-8" else "utf-8"):
+        try:
+            raw = b"".join(bytes((part,)) if isinstance(part, int) else part.encode(candidate_encoding) for part in parts)
+            return raw.decode(candidate_encoding)
+        except UnicodeError:
+            continue
+    return None
 
 
 @lru_cache(maxsize=256)
-def _dependency_strings(text: str) -> tuple[str, ...]:
+def _dependency_strings(text: str, encoding: str = "") -> tuple[str, ...]:
     result: list[str] = []
+    declared_encoding = re.search(r"(?m)^--\s*encoding:\s*([^\r\n]+)", text)
+    if declared_encoding:
+        encoding = declared_encoding.group(1).strip()
+    encoding = encoding or "gbk"
     for call in iter_lua_calls(text):
         call_name = re.split(r"[.:]", call.callee)[-1]
         if call_name == "Include" and call.arguments:
-            candidate = _unquote_lua(call.arguments[0])
-            if candidate:
+            candidate = _unquote_lua(call.arguments[0], encoding)
+            if candidate and not re.search(r"[\x00-\x1f\x7f]", candidate):
                 result.append(candidate)
         elif call_name in {"AddAttribute", "SetTimer", "ExecuteScript"}:
             for argument in call.arguments:
-                candidate = _unquote_lua(argument)
-                if candidate and candidate.lower().endswith(".lua"):
+                candidate = _unquote_lua(argument, encoding)
+                if candidate and not re.search(r"[\x00-\x1f\x7f]", candidate) and candidate.lower().endswith(".lua"):
                     result.append(candidate)
     return tuple(dict.fromkeys(result))
 
@@ -350,12 +423,111 @@ def is_server_side_dependency(script_path: str) -> bool:
     return normalized.startswith("scripts/map/")
 
 
+def _decompiler_diagnostics(text: str, stderr: str = "") -> list[str]:
+    """A zero exit status can still produce diagnostic pseudocode."""
+    pattern = re.compile(
+        r"diagnostic pseudocode|recovery errors?|\[unluac error\]|"
+        r"residual[ -]+table[ -]+set[ -]+list|"
+        r"output may not recompile or preserve behavior",
+        re.IGNORECASE,
+    )
+    return list(dict.fromkeys(
+        line.strip()[:400]
+        for line in (text + "\n" + stderr).splitlines()
+        if pattern.search(line)
+    ))[:20]
+
+
 class LuaLoader:
     def __init__(self, paths: AnalyzerPaths, output_dir: Path):
         self.paths = paths
         self.output_dir = output_dir
         self.cache: dict[Path, SourceArtifact] = {}
         self._lock = threading.Lock()
+        self._decompiler_identity: tuple[str, str] | None = None
+
+    def _identity(self) -> tuple[str, str]:
+        if self._decompiler_identity is None:
+            try:
+                digest = hashlib.sha256(self.paths.decompiler.read_bytes()).hexdigest()
+            except OSError:
+                digest = ""
+            version = "unluac-rs 1.4.4" if digest == "879c6b5f4bdb23bd82ba0579c1c844e7afb28f3b641a036ff10c734d6a92e050" else "自定义/未识别版本"
+            self._decompiler_identity = version, digest
+        return self._decompiler_identity
+
+    def _recover_skill_functions(self, path: Path, data: bytes, output: Path) -> tuple[str, Path | None, dict]:
+        """Only strict, independently named zero-capture Skill.lh functions."""
+        if path.name.casefold() != "skill.lh" or data[:6] != b"\x1bLua\x51\x00":
+            return "", None, {}
+        try:
+            relative = path.relative_to(self.paths.root.resolve()).as_posix().casefold()
+        except ValueError:
+            return "", None, {}
+        if relative != "scripts/include/skill.lh":
+            return "", None, {}
+        report = {"scope": "Lua5.1 root CLOSURE/SETGLOBAL; zero outer upvalues",
+                  "file_reliable": False, "whole_file_initializers_recovered": False,
+                  "lua_executed": False, "recovered": [], "rejected": []}
+        try:
+            candidates, rejected = isolate_lua51_global_functions(data, stats=report)
+        except ValueError as exc:
+            report["error"] = str(exc)
+            return "", None, report
+        report["rejected"] = rejected
+        report["candidate_count"] = len(candidates)
+        if len(candidates) > 150:
+            report["error"] = "独立函数候选超过安全范围，未继续恢复"
+            return "", None, report
+        directory = output.parent / (output.name + ".独立函数")
+        directory.mkdir(parents=True, exist_ok=True)
+        blocks = []
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        for candidate in candidates:
+            chunk = candidate.pop("chunk")
+            child_start = candidate["original_offset"]
+            child_end = child_start + candidate["original_bytes"]
+            candidate["original_function_sha256"] = hashlib.sha256(data[child_start:child_end]).hexdigest()
+            candidate["original_function_copied_without_rewriting"] = True
+            candidate["wrapper_generated"] = True
+            input_path = directory / (candidate["name"] + ".luac")
+            input_path.write_bytes(chunk)
+            candidate["isolated_input"] = str(input_path)
+            try:
+                completed = subprocess.run(
+                    [str(self.paths.decompiler), "-i", str(input_path), "-e", "gbk",
+                     "-m", "strict", "--generate-mode", "strict"],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    creationflags=flags, check=False, timeout=30,
+                )
+                candidate["exit_code"] = completed.returncode
+                source = completed.stdout.decode("utf-8", errors="strict")
+                error = completed.stderr.decode("utf-8", errors="replace")
+                diagnostics = _decompiler_diagnostics(source, error)
+                if completed.returncode or diagnostics or candidate["name"] not in extract_function_blocks(source):
+                    candidate["reason"] = error.strip()[:1000] or "严格输出未包含可确认的命名函数"
+                    candidate["diagnostics"] = diagnostics
+                    report["rejected"].append(candidate)
+                    continue
+            except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
+                candidate["reason"] = str(exc)
+                report["rejected"].append(candidate)
+                continue
+            destination = directory / (candidate["name"] + ".lua")
+            destination.write_text(source, encoding="utf-8-sig", newline="\n")
+            candidate["strict_source_output"] = str(destination)
+            report["recovered"].append(candidate)
+            blocks.append(source)
+        report["recovered_count"] = len(blocks)
+        report["rejected_count"] = len(report["rejected"])
+        report["limitation"] = "仅这些独立函数参与共享helper分析；整文件、表初始化、捕获外层变量及未明确命名的函数均未恢复。全局表引用保留为符号，不补值。"
+        if not blocks:
+            return "", None, report
+        text = "\n\n".join(blocks)
+        destination = output.with_name(output.name + ".独立恢复.lua")
+        destination.write_text("-- 仅独立严格恢复函数；不是整份共享脚本的完整恢复\n" + text,
+                               encoding="utf-8-sig", newline="\n")
+        return text, destination, report
 
     def resolve_script(self, script_path: str, *, parent: Path | None = None) -> Path | None:
         normalized = script_path.strip().replace("\\", "/").lstrip("/")
@@ -394,11 +566,18 @@ class LuaLoader:
         data = resolved.read_bytes()
         kind, version = detect_lua_kind(data)
         warnings: list[str] = []
+        diagnostics: list[str] = []
+        recovered_text = ""
+        recovered_output: Path | None = None
+        recovery: dict = {}
+        decompiler_version = decompiler_sha256 = ""
         output_path: Path | None = None
         if kind == "source":
             text, encoding = read_text_auto(resolved)
             status = f"无需反编译({encoding})"
         elif kind == "bytecode":
+            encoding = "gbk"
+            decompiler_version, decompiler_sha256 = self._identity()
             command = [
                 str(self.paths.decompiler),
                 "-i",
@@ -420,9 +599,20 @@ class LuaLoader:
                 error = completed.stderr.decode("utf-8", errors="replace").strip()
                 raise RuntimeError(f"反编译失败（退出码 {completed.returncode}）：{error}")
             text = completed.stdout.decode("utf-8", errors="replace")
+            stderr = completed.stderr.decode("utf-8", errors="replace")
+            diagnostics = _decompiler_diagnostics(text, stderr)
             output_path = self._decompiled_destination(resolved)
             output_path.write_text(text, encoding="utf-8-sig", newline="\n")
-            status = "反编译成功"
+            if diagnostics:
+                status = "反编译有诊断（仅供参考）"
+                recovered_text, recovered_output, recovery = self._recover_skill_functions(resolved, data, output_path)
+                if recovered_text:
+                    status = "部分函数严格恢复（整体仍有诊断）"
+                    warnings.append(f"共享脚本整体仍不可靠；{recovery['root_child_count']} 个子函数中已独立严格恢复 {recovery['recovered_count']} 个零捕获函数，拒绝 {recovery['rejected_count']} 个，另 {recovery['unmapped_root_children']} 个未明确命名；表初始化未用。")
+                else:
+                    warnings.append("反编译结果存在恢复异常，未作为可靠Lua逻辑解析: " + diagnostics[0])
+            else:
+                status = "反编译成功"
         else:
             raise RuntimeError(f"不是可识别的 Lua 源码或标准 Lua 字节码：{version}")
 
@@ -434,6 +624,14 @@ class LuaLoader:
             decompile_status=status,
             decompiled_output=output_path,
             warnings=warnings,
+            decompile_reliable=not diagnostics,
+            decompile_diagnostics=diagnostics,
+            recovered_source_text=recovered_text,
+            recovered_output=recovered_output,
+            function_recovery=recovery,
+            decompiler_version=decompiler_version,
+            decompiler_sha256=decompiler_sha256,
+            source_encoding=encoding,
         )
         with self._lock:
             self.cache[resolved] = artifact
@@ -441,10 +639,12 @@ class LuaLoader:
 
     def load_with_dependencies(self, main_path: Path, max_dependencies: int = 40) -> tuple[SourceArtifact, list[SourceArtifact]]:
         main = self.load(main_path)
+        if not main.decompile_reliable:
+            return main, []
         dependencies: list[SourceArtifact] = []
         seen = {main.path}
         queue: list[tuple[str, Path]] = [
-            (dependency, main.path.parent) for dependency in _dependency_strings(main.text)
+            (dependency, main.path.parent) for dependency in _dependency_strings(main.text, main.source_encoding)
         ]
         while queue and len(dependencies) < max_dependencies:
             raw_path, parent = queue.pop(0)
@@ -466,7 +666,12 @@ class LuaLoader:
                 continue
             dependencies.append(artifact)
             main.dependencies.append(resolved)
-            queue.extend((value, resolved.parent) for value in _dependency_strings(artifact.text))
+            for warning in artifact.warnings:
+                main.warnings.append(f"依赖 {raw_path}: {warning}")
+            if artifact.decompile_reliable:
+                queue.extend((value, resolved.parent) for value in _dependency_strings(artifact.text, artifact.source_encoding))
+            elif artifact.recovered_source_text:
+                queue.extend((value, resolved.parent) for value in _dependency_strings(artifact.recovered_source_text, artifact.source_encoding))
         if queue:
             main.warnings.append(f"依赖脚本超过 {max_dependencies} 个，已停止继续展开")
         return main, dependencies
@@ -752,7 +957,10 @@ def analyze_skill_ids(
         try:
             if script_key not in script_results:
                 main, dependencies = loader.load_with_dependencies(resolved_script)
-                facts = analyze_lua(main.text, [item.text for item in dependencies])
+                if main.decompile_reliable:
+                    facts = analyze_lua(main.text, [item.text if item.decompile_reliable else item.recovered_source_text for item in dependencies if item.decompile_reliable or item.recovered_source_text])
+                else:
+                    facts = LuaFacts()
                 facts.warnings.extend(main.warnings)
                 if main.missing_dependencies:
                     facts.warnings.append("本地依赖未找到: " + ";".join(main.missing_dependencies))
@@ -789,6 +997,7 @@ def analyze_skill_ids(
                 "UI简述": _ui_value(ui_rows, "SimpleDesc"),
                 "伤害类型": _joined(damage_types),
                 "是否穿透": "可穿透" if facts.penetration else "",
+                "是否穿刺": "穿刺伤害" if facts.puncture else "",
                 "技能释放方式": CAST_MODE_NAMES.get(cast_mode, cast_mode),
                 "技能类型": _skill_type(facts),
                 "技能读条帧": _property_text(facts, "nPrepareFrames", "nPrepareFrame"),
@@ -819,6 +1028,9 @@ def analyze_skill_ids(
                 "触发的技能ID": _joined(facts.called_skill_ids),
                 "属性类型(原始)": _joined(facts.attribute_types),
                 "解析到的依赖函数": _joined(facts.reachable_helpers),
+                "基础伤害表达式": _joined(facts.damage_base_expressions),
+                "伤害浮动表达式": _joined(facts.damage_rand_expressions),
+                "解析说明": _joined(facts.warnings),
             }
         )
         emit(f"技能 {skill_id}：解析完成")
@@ -844,7 +1056,8 @@ def analyze_skill_ids(
     _write_csv(issue_csv, ISSUE_COLUMNS, issues)
 
     json_payload = {
-        "version": "3.0.2",
+        "version": __version__,
+        "analysis_schema_version": "v4-skill-facts-1",
         "game_root": str(paths.root),
         "requested_skill_ids": skill_ids,
         "skills": output_skills,
@@ -860,8 +1073,29 @@ def analyze_skill_ids(
                     "decompiled_output": str(value.main.decompiled_output or ""),
                     "server_side_dependencies": value.main.server_dependencies,
                     "missing_dependencies": value.main.missing_dependencies,
+                    "decompile_reliable": value.main.decompile_reliable,
+                    "decompile_diagnostics": value.main.decompile_diagnostics,
+                    "decompiler_version": value.main.decompiler_version,
+                    "decompiler_sha256": value.main.decompiler_sha256,
+                    "source_encoding": value.main.source_encoding,
+                    "function_recovery": value.main.function_recovery,
+                    "recovered_output": str(value.main.recovered_output or ""),
                 },
                 "dependencies": [str(item.path) for item in value.dependencies],
+                "dependency_artifacts": [
+                    {
+                        "path": str(item.path),
+                        "decompile_status": item.decompile_status,
+                        "decompile_reliable": item.decompile_reliable,
+                        "decompile_diagnostics": item.decompile_diagnostics,
+                        "decompiler_version": item.decompiler_version,
+                        "decompiler_sha256": item.decompiler_sha256,
+                        "source_encoding": item.source_encoding,
+                        "function_recovery": item.function_recovery,
+                        "recovered_output": str(item.recovered_output or ""),
+                    }
+                    for item in value.dependencies
+                ],
                 "facts": value.facts.to_dict(),
             }
             for key, value in script_results.items()

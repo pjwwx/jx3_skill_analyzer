@@ -4,7 +4,7 @@ $ErrorActionPreference = "Stop"
 $ProjectDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Checkout = Join-Path $ProjectDir ".deps\unluac-rs"
 $Output = Join-Path $ProjectDir "vendor\unluac.exe"
-$Tag = "v1.4.3"
+$Tag = "v1.4.4"
 
 $Git = Get-Command git -ErrorAction SilentlyContinue
 if (-not $Git) {
@@ -35,7 +35,7 @@ else {
     }
 }
 
-& $Cargo.Source build --manifest-path (Join-Path $Checkout "Cargo.toml") --release --package unluac-cli
+& $Cargo.Source build --locked --manifest-path (Join-Path $Checkout "Cargo.toml") --release --package unluac-cli
 if ($LASTEXITCODE -ne 0) {
     throw "unluac-rs build failed."
 }
